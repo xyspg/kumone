@@ -232,6 +232,65 @@ struct ProgressiveLoaderFLACTests {
         #expect(try Data(contentsOf: part) == payload)
     }
 
+    // A seek made while the loader is still decoding ahead must not let the
+    // audio it was in the middle of producing through: the caller has already
+    // re-based its clock, so those buffers would play old audio under the new
+    // position and leave everything after them late (field: lyrics out of
+    // step after a lyric-line jump early in a streamed song). The ramp fixture
+    // is lossless, so a buffer's first sample says where in the file it is.
+    @Test func seekWhileDecodingDropsAudioFromTheOldPosition() throws {
+        let caf = try Fixtures.writeRampCAF(seconds: 120, name: "ramp-120s")
+        let flac = try Self.flacFixture(from: caf, name: "stream-ramp-120s")
+        let server = try TestHTTPServer(serving: try Data(contentsOf: flac))
+        defer { server.stop() }
+        let part = Fixtures.dir.appendingPathComponent("seek-live-\(UUID().uuidString).part")
+        defer { try? FileManager.default.removeItem(at: part) }
+        let output = try #require(AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2))
+        let callbackQueue = DispatchQueue(label: "stream-seek-live-test")
+        let loader = ProgressiveLoader(remoteURL: server.url, formatHint: "flac",
+                                       partURL: part, output: output, queue: callbackQueue)
+        final class Outcome: @unchecked Sendable {
+            var buffers = 0
+            var seeking = false
+            var startsAfterSeek: [Double] = []
+            var error: Error?
+        }
+        let outcome = Outcome()
+        let target = 80.0
+        let done = DispatchSemaphore(value: 0)
+        // No backpressure: the whole file is on localhost, so the loader is
+        // decoding flat out when the seek arrives — as on a deck still filling
+        // its buffer.
+        loader.onBuffer = { [weak loader] buffer in
+            outcome.buffers += 1
+            if outcome.seeking {
+                let first = Double(buffer.floatChannelData![0][0]) / 1e-7 / Fixtures.rampRate
+                outcome.startsAfterSeek.append(first)
+                if outcome.startsAfterSeek.count == 8 { done.signal() }
+            } else if outcome.buffers == 4 {
+                outcome.seeking = true
+                loader?.seek(to: target)
+            }
+        }
+        loader.onError = { error in
+            outcome.error = error
+            done.signal()
+        }
+        loader.start()
+        defer { loader.cancel() }
+        #expect(done.wait(timeout: .now() + 30) == .success)
+        callbackQueue.sync {
+            #expect(outcome.error == nil)
+            #expect(outcome.startsAfterSeek.count >= 8)
+            // The byte offset is an estimate, hence the second of slack; the
+            // old position was two seconds in.
+            #expect(outcome.startsAfterSeek.allSatisfy { abs($0 - target) < 1 + 0.5 * 8 },
+                    "buffers after the seek start at \(outcome.startsAfterSeek)")
+            #expect(abs((outcome.startsAfterSeek.first ?? 0) - target) < 1,
+                    "first buffer after the seek starts at \(outcome.startsAfterSeek.first ?? -1)")
+        }
+    }
+
     // Hi-Res FLAC (48k source → 44.1k graph rate): the loader owns the rate
     // conversion; frame count must match at the OUTPUT rate.
     @Test func hiResFLACStreamResamples() throws {

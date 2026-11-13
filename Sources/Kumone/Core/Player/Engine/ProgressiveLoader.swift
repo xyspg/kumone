@@ -161,6 +161,13 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
     private var outSampleRate: Double = 0
     private var converterReady = false
     private var completed = false
+    /// Counts `seek` calls, bumped on the caller's thread the moment one is
+    /// made. Anything decoded for an earlier count is audio from the old
+    /// position and must not reach the caller — see `notifyDecoded`.
+    private var requestedSeekEpoch = 0
+    /// The seek count the decoder is currently producing for. workQueue only;
+    /// it trails `requestedSeekEpoch` until `seekOnQueue` gets its turn.
+    private var decodingSeekEpoch = 0
 
     init(remoteURL: URL, formatHint: String?, partURL: URL,
          output: AVAudioFormat, queue: DispatchQueue) {
@@ -250,7 +257,11 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
     ///   best effort for FLAC/M4A (an unparseable resync surfaces as an error
     ///   and the caller falls back to a fresh load).
     func seek(to seconds: TimeInterval) {
-        workQueue.async { self.seekOnQueue(to: seconds) }
+        statLock.lock()
+        requestedSeekEpoch += 1
+        let epoch = requestedSeekEpoch
+        statLock.unlock()
+        workQueue.async { self.seekOnQueue(to: seconds, epoch: epoch) }
     }
 
     // MARK: - workQueue implementations
@@ -300,7 +311,10 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
         }
     }
 
-    private func seekOnQueue(to seconds: TimeInterval) {
+    private func seekOnQueue(to seconds: TimeInterval, epoch: Int) {
+        // Adopted even when the seek below turns out to be a no-op: the old
+        // transfer then simply carries on, and its audio is current again.
+        decodingSeekEpoch = epoch
         guard !cancelled, !failed else { return }
         statLock.lock()
         let bps = converterReady ? bytesPerSecondLocked : nil
@@ -361,6 +375,25 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
     /// Deliver a result closure on the engine queue, preserving order.
     private func notify(_ block: @escaping () -> Void) {
         callbackQueue.async(execute: block)
+    }
+
+    /// `notify` for what the decoder produced (PCM, and the end of it): dropped
+    /// if a seek was requested after it was decoded.
+    ///
+    /// `seek` returns to the caller at once, but the work queue only acts on
+    /// it after whatever it was already doing — and while the stream is still
+    /// filling its buffer that is decoding, seconds of audio at a time. The
+    /// caller has re-based its clock on the new position by then, so playing
+    /// those buffers would put old audio under the new position and leave
+    /// everything after them late by their length.
+    private func notifyDecoded(_ block: @escaping () -> Void) {
+        let epoch = decodingSeekEpoch
+        callbackQueue.async {
+            self.statLock.lock()
+            let current = self.requestedSeekEpoch == epoch
+            self.statLock.unlock()
+            if current { block() }
+        }
     }
 
     // MARK: - AudioFileStream callbacks (workQueue)
@@ -600,7 +633,7 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
         decodedFrames += AVAudioFramePosition(buffer.frameLength)
         statLock.unlock()
         guard accum != nil else {
-            notify { self.onBuffer?(buffer) }
+            notifyDecoded { self.onBuffer?(buffer) }
             return
         }
         var offset: AVAudioFrameCount = 0
@@ -633,7 +666,7 @@ final class ProgressiveLoader: NSObject, @unchecked Sendable {
     private func flushAccum() {
         guard let full = accum, full.frameLength > 0, let outFormat else { return }
         accum = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: accumCapacity)
-        notify { self.onBuffer?(full) }
+        notifyDecoded { self.onBuffer?(full) }
     }
 
     private func resetAccum() {
@@ -781,7 +814,7 @@ extension ProgressiveLoader: URLSessionDataDelegate {
         pendingPacketDescs = []
         scratchPacketBytes = []
         scratchPacketDescs = []
-        notify { self.onCompleted?() }
+        notifyDecoded { self.onCompleted?() }
     }
 }
 #endif
