@@ -625,7 +625,7 @@ final class PlayerService: ObservableObject {
         if wasArmed { disarmTransition(keepingPrerender: true) }
         progress = seconds
         updateLyricsCursor(at: seconds)
-        engine.seek(deck: activeDeck, to: seconds)
+        seekActiveDeck(to: seconds)
         NowPlayingManager.shared.updateElapsed(seconds, rate: isPlaying ? 1 : 0)
         if !SettingsManager.shared.automixEnabled {
             if !Self.gaplessPrefetchReady(position: seconds, duration: duration) {
@@ -641,6 +641,94 @@ final class PlayerService: ObservableObject {
         }
         persistState()
         completion?()
+    }
+
+    /// Moves the active deck's playhead, by the most exact means it has.
+    ///
+    /// A file deck seeks to the sample. A stream deck can only restart its
+    /// transfer at a byte offset guessed from the average bitrate, and on
+    /// variable-bitrate material (FLAC above all) the audio comes back seconds
+    /// away from the position the engine then counts from — so the lyrics and
+    /// the scrubber run beside the song for the rest of it. So a stream is
+    /// left behind the moment there is a file to leave it for:
+    ///
+    /// - the whole track is already on disk (the mirror finished while the
+    ///   deck was still playing the stream): seek in that file instead;
+    /// - it is not: the stream seek is all there is for this one, but it also
+    ///   abandons the mirror, so nothing would ever complete the file. Fetch
+    ///   it on the side, and the next seek is exact.
+    private func seekActiveDeck(to seconds: TimeInterval) {
+        guard deckLoaded, !hasLocalFile else {
+            engine.seek(deck: activeDeck, to: seconds)
+            return
+        }
+        if let local = currentLocalURL, moveActiveDeckToFile(local, at: seconds) { return }
+        engine.seek(deck: activeDeck, to: seconds)
+        completeStreamedFileAfterSeek()
+    }
+
+    /// Swaps the stream on the active deck for the complete file of the same
+    /// track, with the playhead at `seconds`. False if the file cannot be
+    /// opened, in which case the deck is untouched.
+    private func moveActiveDeckToFile(_ local: URL, at seconds: TimeInterval) -> Bool {
+        // The stream started at unity; keep the level where the listener has
+        // been hearing it, as the stream-failure fallback does.
+        guard let fileDuration = try? engine.loadFile(at: local, on: activeDeck, trimDB: 0) else {
+            return false
+        }
+        deckFiles[activeDeck] = local
+        hasLocalFile = true
+        isBuffering = false
+        duration = fileDuration
+        if isPlaying {
+            engine.play(deck: activeDeck, from: min(seconds, max(0, fileDuration - 0.1)))
+        } else {
+            // Paused: stay silent. The play button re-issues play() from
+            // `progress`, which the caller has just set.
+            enginePaused = false
+        }
+        if let track = currentTrack {
+            NowPlayingManager.shared.updateMetadata(for: track, duration: fileDuration)
+        }
+        return true
+    }
+
+    /// The generation `completeStreamedFileAfterSeek` is already fetching for.
+    private var streamedFileFetchGeneration: Int?
+
+    private func completeStreamedFileAfterSeek() {
+        let generation = resolveGeneration
+        guard currentLocalURL == nil, streamedFileFetchGeneration != generation,
+              let key = currentCacheKey, let remote = currentRemoteURL else { return }
+        streamedFileFetchGeneration = generation
+        Task { [weak self] in
+            let local = try? await EngineAudioCache.shared.download(from: remote, key: key)
+            guard let self, generation == self.resolveGeneration else { return }
+            guard let local else {
+                // Let a later seek try again.
+                self.streamedFileFetchGeneration = nil
+                return
+            }
+            self.currentTrackFileLanded(local, key: key)
+        }
+    }
+
+    /// The complete file of the track the active deck is streaming is now on
+    /// disk — which is exactly what `currentLocalURL` means. The deck keeps
+    /// playing its stream source (so `hasLocalFile` stays honest) until a
+    /// seek moves it over, but everything that reads the *file* — the stem
+    /// pre-render's outgoing side, the pick's lyric line-ends, and the
+    /// queue-order politeness gate — can start now instead of waiting for the
+    /// next track.
+    private func currentTrackFileLanded(_ final: URL, key: EngineAudioCache.Key) {
+        currentLocalURL = final
+        ensureCurrentAnalysis(key: key, fileURL: final)
+        // The words fetched at the start of the song now have something to
+        // sit by.
+        persistCurrentLyricsSidecar(audio: final)
+        // The prefetch pipeline may have deferred while this track was still
+        // streaming (same-track repeat) — re-run it.
+        schedulePrefetch()
     }
 
     func toggleShuffle() {
@@ -1285,20 +1373,7 @@ final class PlayerService: ObservableObject {
             Task { [weak self] in
                 guard let final = try? await EngineAudioCache.shared.commitPartFile(for: key),
                       let self, generation == self.resolveGeneration else { return }
-                // The complete file just landed — which is exactly what
-                // `currentLocalURL` means. The deck keeps playing its stream
-                // source (so `hasLocalFile` stays honest), but everything that
-                // reads the *file* — the stem pre-render's outgoing side, the
-                // pick's lyric line-ends, and the queue-order politeness gate —
-                // can start now instead of waiting for the next track.
-                self.currentLocalURL = final
-                self.ensureCurrentAnalysis(key: key, fileURL: final)
-                // The progressive mirror just became a complete file: the words
-                // fetched at the start of the song now have something to sit by.
-                self.persistCurrentLyricsSidecar(audio: final)
-                // The prefetch pipeline may have deferred while this track
-                // was still streaming (same-track repeat) — re-run it.
-                self.schedulePrefetch()
+                self.currentTrackFileLanded(final, key: key)
             }
         case .streamFailed(let deck, _):
             guard deck == activeDeck else { return }
