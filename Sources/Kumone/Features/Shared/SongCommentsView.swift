@@ -26,7 +26,6 @@ struct SongCommentsView: View {
     let track: Track
 
     @StateObject private var content: SongCommentsContent
-    @EnvironmentObject private var account: AccountStore
     @ObservedObject private var toasts = ToastCenter.shared
     @Environment(\.dismiss) private var dismiss
     #if os(iOS)
@@ -76,8 +75,6 @@ struct SongCommentsView: View {
         #endif
     }
 
-    private var canLike: Bool { account.authenticatedAccountID != nil }
-
     // MARK: Header
 
     private var header: some View {
@@ -124,12 +121,40 @@ struct SongCommentsView: View {
 
     // MARK: States
 
+    private var phaseContent: some View {
+        SongCommentsList(track: track, content: content)
+    }
+}
+
+/// One song's comments with their loading, error and empty states: hot ones,
+/// then the latest a page at a time. Shared by the comments sheet and the
+/// iPhone now-playing page.
+struct SongCommentsList: View {
+    let track: Track
+    @ObservedObject var content: SongCommentsContent
+    /// Presents the share sheet for a comment. Without one the list presents
+    /// it itself; the now-playing page passes its own, since a sheet raised
+    /// from inside its pager closes again when the pages refresh.
+    var onShare: ((SongComment) -> Void)? = nil
+    @EnvironmentObject private var account: AccountStore
+    @State private var sharedComment: SongComment?
+
+    private var canLike: Bool { account.authenticatedAccountID != nil }
+
+    var body: some View {
+        phaseContent
+            .sheet(item: $sharedComment) { comment in
+                CommentShareSheet(track: track, comment: comment)
+            }
+    }
+
     @ViewBuilder
     private var phaseContent: some View {
         switch content.phase {
         case .idle, .loading:
             ProgressView()
                 .controlSize(.small)
+                .tint(.secondary)
         case .failed(let message):
             ErrorStateView(message: message) {
                 Task { await content.retry() }
@@ -184,7 +209,8 @@ struct SongCommentsView: View {
             comment: comment,
             canLike: canLike,
             isPending: content.pendingLikes.contains(comment.id),
-            onLike: { toggleLike(comment) }
+            onLike: { toggleLike(comment) },
+            onShare: { share(comment) }
         )
     }
 
@@ -194,6 +220,7 @@ struct SongCommentsView: View {
             if content.isLoadingMore {
                 ProgressView()
                     .controlSize(.small)
+                    .tint(.secondary)
             } else if let error = content.loadMoreError {
                 VStack(spacing: 6) {
                     Text(error)
@@ -213,6 +240,14 @@ struct SongCommentsView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 14)
+    }
+
+    private func share(_ comment: SongComment) {
+        if let onShare {
+            onShare(comment)
+        } else {
+            sharedComment = comment
+        }
     }
 
     private func toggleLike(_ comment: SongComment) {
@@ -237,6 +272,7 @@ private struct SongCommentRow: View {
     let canLike: Bool
     let isPending: Bool
     let onLike: () -> Void
+    let onShare: () -> Void
 
     #if os(macOS)
     private static let nameFont = Font.system(size: 12.5, weight: .medium)
@@ -286,7 +322,7 @@ private struct SongCommentRow: View {
                 Text(comment.content)
                     .font(Self.bodyFont)
                     .foregroundStyle(.primary)
-                    .textSelection(.enabled)
+                    .textSelectionOnMac()
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -294,7 +330,7 @@ private struct SongCommentRow: View {
                     Text(replyText(reply))
                         .font(Self.replyFont)
                         .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                        .textSelectionOnMac()
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 10)
@@ -310,8 +346,21 @@ private struct SongCommentRow: View {
                 .opacity(0.5)
                 .padding(.leading, Self.avatarSize + 10)
         }
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button(action: onShare) {
+                Label("分享评论", systemImage: "square.and.arrow.up")
+            }
+            Button {
+                Platform.copyToPasteboard(string: comment.content)
+                ToastCenter.shared.show(String(localized: "评论已复制"))
+            } label: {
+                Label("复制评论", systemImage: "doc.on.doc")
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("songCommentRow")
+        .accessibilityAction(named: Text("分享评论"), onShare)
     }
 
     private var metadata: String {
@@ -353,5 +402,19 @@ private struct SongCommentRow: View {
         .accessibilityLabel(comment.liked ? "取消点赞" : "点赞")
         .accessibilityValue(Text(verbatim: String(comment.likedCount)))
         .accessibilityIdentifier("songCommentLikeButton")
+    }
+}
+
+private extension View {
+    /// Selectable text on macOS. On iOS a long press on selectable text
+    /// opens the text's own menu, which would hide the row's share and copy
+    /// menu; 复制评论 there copies the comment instead.
+    @ViewBuilder
+    func textSelectionOnMac() -> some View {
+        #if os(macOS)
+        textSelection(.enabled)
+        #else
+        self
+        #endif
     }
 }

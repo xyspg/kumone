@@ -25,8 +25,13 @@ struct NowPlayingView: View {
     @State private var isUserScrolling = false
     @State private var showLyricsOnMobile = false
     @State private var showQueueOnMobile = false
+    /// Lyrics or comments in the regular page's right column (macOS, iPad).
+    @State private var regularColumnPage = RegularColumnPage.lyrics
     #if os(iOS)
     @State private var showSoundEffects = false
+    /// Held here rather than by the controls so the panel can sit above the
+    /// whole page, with a catcher that closes it on a tap anywhere else.
+    @State private var showsVolumeControl = false
     #endif
 
     var body: some View {
@@ -53,6 +58,11 @@ struct NowPlayingView: View {
             // Pin to the screen width so an intrinsically-wide child can never
             // stretch the ZStack and push the corner overlays off-screen.
             .frame(width: geo.size.width)
+            #if os(iOS)
+            .overlayPreferenceValue(CompactVolumeButtonAnchorKey.self) { anchor in
+                volumeLayer(buttonAnchor: anchor)
+            }
+            #endif
             #if os(macOS)
             .overlay(alignment: .topTrailing) {
                 // Toward the top-trailing corner, level with the window
@@ -285,12 +295,12 @@ struct NowPlayingView: View {
         // `.infinity` across an ultra-wide display (iPad landscape, ~1368pt)
         // left the left column's content floating in an oversized half and a
         // wide blank gutter on the right (#62).
-        let maxBandWidth: CGFloat = hasLyricsColumn ? 1040 : 560
+        let maxBandWidth: CGFloat = hasRegularRightColumn ? 1040 : 560
         return HStack(spacing: 0) {
             leftColumn(artworkSize: artworkSize)
                 .frame(maxWidth: .infinity)
-            if hasLyricsColumn {
-                lyricsColumn
+            if hasRegularRightColumn {
+                regularRightColumn
                     .frame(maxWidth: .infinity)
             }
         }
@@ -610,14 +620,16 @@ struct NowPlayingView: View {
                     #endif
                 } else {
                     #if os(iOS)
-                    IOSImmersiveLyricsColumn()
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(AppAnimation.standard) {
-                                showLyricsOnMobile = false
+                    NowPlayingLyricsPager(isShown: true, horizontalInset: 32) {
+                        IOSImmersiveLyricsColumn()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(AppAnimation.standard) {
+                                    showLyricsOnMobile = false
+                                }
                             }
-                        }
-                        .transition(.opacity.combined(with: .scale(scale: 1.05)))
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 1.05)))
                     #else
                     lyricsColumn
                         .contentShape(Rectangle())
@@ -652,9 +664,17 @@ struct NowPlayingView: View {
         return VStack(spacing: 20) {
             Spacer().frame(height: 44)
             if showLyricsOnMobile {
+                #if os(iOS)
+                NowPlayingLyricsPager(isShown: true, horizontalInset: 16) {
+                    lyricsColumn
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.opacity)
+                #else
                 lyricsColumn
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .transition(.opacity)
+                #endif
             } else {
                 VStack(spacing: 20) {
                     artworkView(size: artworkDim)
@@ -705,7 +725,9 @@ struct NowPlayingView: View {
                     CompactQueueContent()
                         .transition(.opacity)
                 } else {
-                    IOSImmersiveLyricsColumn()
+                    NowPlayingLyricsPager(isShown: showLyricsOnMobile, horizontalInset: 32) {
+                        IOSImmersiveLyricsColumn()
+                    }
                         .opacity(showLyricsOnMobile ? 1 : 0)
                         .allowsHitTesting(showLyricsOnMobile)
                         .accessibilityHidden(!showLyricsOnMobile)
@@ -738,11 +760,49 @@ struct NowPlayingView: View {
         }
     }
 
+    /// The volume panel, above the button that opened it, over a clear
+    /// catcher that covers the page: a tap anywhere else only closes it.
+    @ViewBuilder
+    private func volumeLayer(buttonAnchor: Anchor<CGRect>?) -> some View {
+        if let buttonAnchor {
+            GeometryReader { proxy in
+                let button = proxy[buttonAnchor]
+                ZStack(alignment: .topLeading) {
+                    if showsVolumeControl {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .ignoresSafeArea()
+                            .onTapGesture(perform: closeVolumeControl)
+                            .accessibilityHidden(true)
+                    }
+
+                    Color.clear
+                        .frame(width: button.width, height: button.height)
+                        .overlay(alignment: .bottom) {
+                            if showsVolumeControl {
+                                CompactVolumePopover()
+                                    .offset(y: -button.height)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .bottom)))
+                            }
+                        }
+                        .position(x: button.midX, y: button.midY)
+                }
+            }
+        }
+    }
+
+    private func closeVolumeControl() {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            showsVolumeControl = false
+        }
+    }
+
     private var immersiveControls: some View {
         VStack(spacing: 17) {
             NowPlayingScrubber()
             CompactTransportControls()
             CompactSecondaryControls(
+                showsVolumeControl: $showsVolumeControl,
                 showsLyrics: showLyricsOnMobile,
                 showsQueue: showQueueOnMobile,
                 onToggleLyrics: toggleImmersiveLyrics,
@@ -867,8 +927,10 @@ struct NowPlayingView: View {
                     .opacity(showLyricsOnMobile ? 0 : 1)
                     .allowsHitTesting(!showLyricsOnMobile)
 
-                IOSMinimalLyricsColumn {
-                    showLyricsOnMobile = false
+                NowPlayingLyricsPager(isShown: showLyricsOnMobile, horizontalInset: 32) {
+                    IOSMinimalLyricsColumn {
+                        showLyricsOnMobile = false
+                    }
                 }
                 .opacity(showLyricsOnMobile ? 1 : 0)
                 .allowsHitTesting(showLyricsOnMobile)
@@ -1236,6 +1298,50 @@ struct NowPlayingView: View {
     @ViewBuilder
     private var lyricsColumn: some View {
         lyricsScroll(topInset: 200, bottomInset: 240, horizontalPadding: 24)
+    }
+
+    // MARK: - Regular right column
+
+    /// The song's comments sit beside its lyrics, one switch away, so a song
+    /// without lyrics still has a right column when it has comments.
+    private var hasRegularRightColumn: Bool {
+        hasLyricsColumn || commentsTrack != nil
+    }
+
+    private var commentsTrack: Track? {
+        guard let track = player.currentTrack,
+              SongCommentsMenuButton.isAvailable(for: track) else { return nil }
+        return track
+    }
+
+    private var regularRightColumn: some View {
+        ZStack(alignment: .top) {
+            Group {
+                if regularColumnPage == .comments, let track = commentsTrack {
+                    RegularCommentsPanel(track: track)
+                        .id(track.id)
+                        .padding(.top, 52)
+                        .transition(.opacity)
+                } else if hasLyricsColumn {
+                    lyricsColumn
+                        .transition(.opacity)
+                } else {
+                    Text("暂无歌词")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.white.opacity(0.5))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .transition(.opacity)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if commentsTrack != nil {
+                RegularColumnSwitch(selection: $regularColumnPage)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: regularColumnPage)
     }
 
     /// The scrolling lyric list shared by the regular page and the
@@ -1888,9 +1994,17 @@ private struct CompactVolumePopover: View {
     }
 }
 
+private struct CompactVolumeButtonAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = value ?? nextValue()
+    }
+}
+
 private struct CompactSecondaryControls: View {
     @EnvironmentObject private var player: PlayerService
-    @State private var showsVolumeControl = false
+    @Binding var showsVolumeControl: Bool
     let showsLyrics: Bool
     let showsQueue: Bool
     let onToggleLyrics: () -> Void
@@ -1924,14 +2038,9 @@ private struct CompactSecondaryControls: View {
                     showsVolumeControl.toggle()
                 }
             }
-            .overlay(alignment: .bottom) {
-                if showsVolumeControl {
-                    CompactVolumePopover()
-                        .offset(y: -44)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .bottom)))
-                        .zIndex(1)
-                }
-            }
+            // The panel itself is drawn by the page (`volumeLayer`), above
+            // everything else, from this button's frame.
+            .anchorPreference(key: CompactVolumeButtonAnchorKey.self, value: .bounds) { $0 }
 
             secondaryButton(
                 icon: "list.bullet",
